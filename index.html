@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="WOD Timer"/>
+  <meta name="theme-color" content="#080808"/>
+  <title>WOD Timer</title>
+  <link rel="manifest" id="manifest-link"/>
+  <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'%3E%3Crect width='180' height='180' rx='40' fill='%23080808'/%3E%3Ctext x='50%25' y='58%25' text-anchor='middle' dominant-baseline='middle' font-family='Arial Black' font-weight='900' font-size='72' fill='%23FF3B30'%3E⏱%3C/text%3E%3C/svg%3E"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; width: 100%; overflow: hidden; background: #080808; }
+    #root { height: 100dvh; width: 100%; display: flex; align-items: center; justify-content: center; }
+    /* Suppress tap highlight on mobile */
+    * { -webkit-tap-highlight-color: transparent; }
+    button { -webkit-tap-highlight-color: transparent; }
+  </style>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet"/>
+</head>
+<body>
+  <div id="root"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    const manifestData = {
+      name: "WOD Timer", short_name: "WOD Timer",
+      description: "CrossFit-style interval timer",
+      start_url: "./", display: "standalone",
+      background_color: "#080808", theme_color: "#080808", orientation: "portrait",
+      icons: [{ src: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='112' fill='%23080808'/%3E%3Ctext x='50%25' y='58%25' text-anchor='middle' dominant-baseline='middle' font-size='280' fill='%23FF3B30'%3E⏱%3C/text%3E%3C/svg%3E", sizes: "512x512", type: "image/svg+xml", purpose: "any maskable" }]
+    };
+    const blob = new Blob([JSON.stringify(manifestData)], {type:'application/json'});
+    document.getElementById('manifest-link').href = URL.createObjectURL(blob);
+
+    if ('serviceWorker' in navigator) {
+      const swCode = `
+        const CACHE = 'wod-timer-v2';
+        const ASSETS = [self.location.href];
+        self.addEventListener('install', e => { e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS))); self.skipWaiting(); });
+        self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k))))); self.clients.claim(); });
+        self.addEventListener('fetch', e => { e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).catch(() => caches.match(e.request)))); });
+      `;
+      const swBlob = new Blob([swCode], {type:'application/javascript'});
+      navigator.serviceWorker.register(URL.createObjectURL(swBlob)).catch(()=>{});
+    }
+
+
+const MODES = ["AMRAP", "FOR TIME", "EMOM", "TABATA", "CUSTOM"];
+
+const MODE_COLORS = {
+  "AMRAP":    { primary: "#FF3B30", accent: "#FF6B6B", bg: "#1A0000" },
+  "FOR TIME": { primary: "#FF9500", accent: "#FFB84D", bg: "#1A0A00" },
+  "EMOM":     { primary: "#30D158", accent: "#66E68A", bg: "#001A08" },
+  "TABATA":   { primary: "#0A84FF", accent: "#5AC8FA", bg: "#00081A" },
+  "CUSTOM":   { primary: "#BF5AF2", accent: "#DA8FFF", bg: "#0D0018" },
+};
+
+const MODE_DESCRIPTIONS = {
+  "AMRAP":    "As Many Rounds As Possible",
+  "FOR TIME": "Complete the work. Stop the clock.",
+  "EMOM":     "Every Minute On the Minute",
+  "TABATA":   "20s Work / 10s Rest × 8 Rounds",
+  "CUSTOM":   "Build your own interval",
+};
+
+function pad(n) { return String(n).padStart(2, "0"); }
+function formatTime(s) {
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return h > 0 ? `${pad(h)}:${pad(m)}:${pad(sec)}` : `${pad(m)}:${pad(sec)}`;
+}
+function hexToRgb(hex) {
+  return `${parseInt(hex.slice(1,3),16)},${parseInt(hex.slice(3,5),16)},${parseInt(hex.slice(5,7),16)}`;
+}
+
+function useAudio() {
+  const ctxRef = useRef(null);
+  const getCtx = () => {
+    if (!ctxRef.current) ctxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    return ctxRef.current;
+  };
+  const beep = useCallback((freq = 880, duration = 0.15, volume = 0.35) => {
+    try {
+      const ctx = getCtx();
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.connect(g); g.connect(ctx.destination);
+      o.frequency.value = freq;
+      g.gain.setValueAtTime(volume, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+      o.start(ctx.currentTime); o.stop(ctx.currentTime + duration);
+    } catch {}
+  }, []);
+  const speak = useCallback((text) => {
+    try {
+      if (!window.speechSynthesis) return;
+      const utt = new SpeechSynthesisUtterance(text);
+      utt.rate = 1.1; utt.pitch = 1.0; utt.volume = 0.9;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(utt);
+    } catch {}
+  }, []);
+  return { beep, speak };
+}
+
+const ITEM_H = 48;
+
+function NumberPicker({ label, value, onChange, min = 0, max = 99 }) {
+  const count = max - min + 1;
+  const drumRef = useRef(null);
+  const isDragging = useRef(false);
+  const startY = useRef(0);
+  const startVal = useRef(value);
+  const lastY = useRef(0);
+  const velY = useRef(0);
+  const rafRef = useRef(null);
+  const currentVal = useRef(value);
+
+  const clamp = (v) => Math.min(max, Math.max(min, v));
+
+  const scrollToVal = useCallback((v, animate = false) => {
+    const el = drumRef.current;
+    if (!el) return;
+    const target = (v - min) * ITEM_H;
+    el.style.transition = animate ? "transform 0.22s cubic-bezier(0.25,0.46,0.45,0.94)" : "none";
+    el.style.transform = `translateY(${-target}px)`;
+  }, [min]);
+
+  useEffect(() => {
+    currentVal.current = value;
+    scrollToVal(value, false);
+  }, [value, scrollToVal]);
+
+  const startDrag = (y) => {
+    cancelAnimationFrame(rafRef.current);
+    isDragging.current = true;
+    startY.current = y;
+    lastY.current = y;
+    startVal.current = value;
+    currentVal.current = value;
+    velY.current = 0;
+    if (drumRef.current) drumRef.current.style.transition = "none";
+  };
+
+  const moveDrag = (y) => {
+    if (!isDragging.current) return;
+    velY.current = y - lastY.current;
+    lastY.current = y;
+    const delta = y - startY.current;
+    const newVal = clamp(Math.round(startVal.current - delta / ITEM_H));
+    currentVal.current = newVal;
+    if (newVal !== value) onChange(newVal);
+    const el = drumRef.current;
+    if (el) el.style.transform = `translateY(${-(newVal - min) * ITEM_H}px)`;
+  };
+
+  const endDrag = () => {
+    if (!isDragging.current) return;
+    isDragging.current = false;
+    let momentum = velY.current * -1;
+    let cur = currentVal.current;
+    const friction = 0.82;
+    const tick = () => {
+      if (Math.abs(momentum) < 0.4) { scrollToVal(cur, true); return; }
+      momentum *= friction;
+      const next = clamp(cur + Math.round(momentum / ITEM_H * 2));
+      if (next !== cur) { cur = next; onChange(next); }
+      const el = drumRef.current;
+      if (el) el.style.transform = `translateY(${-(cur - min) * ITEM_H}px)`;
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+  };
+
+  const onTouchStart = (e) => { e.preventDefault(); startDrag(e.touches[0].clientY); };
+  const onTouchMove  = (e) => { e.preventDefault(); moveDrag(e.touches[0].clientY); };
+  const onTouchEnd   = ()  => endDrag();
+
+  const onMouseDown = (e) => {
+    startDrag(e.clientY);
+    const onMove = (ev) => moveDrag(ev.clientY);
+    const onUp   = ()   => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); endDrag(); };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const onWheel = (e) => {
+    e.preventDefault();
+    onChange(clamp(value + (e.deltaY > 0 ? 1 : -1)));
+  };
+
+  return (
+    <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:6, userSelect:"none" }}>
+      <div
+        style={{ position:"relative", width:64, height:ITEM_H * 3, overflow:"hidden", cursor:"grab", touchAction:"none" }}
+        onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}
+        onMouseDown={onMouseDown} onWheel={onWheel}
+      >
+        {/* Selection band */}
+        <div style={{ position:"absolute", top:ITEM_H, left:0, right:0, height:ITEM_H,
+          background:"rgba(255,255,255,0.07)",
+          borderTop:"1px solid rgba(255,255,255,0.13)", borderBottom:"1px solid rgba(255,255,255,0.13)",
+          pointerEvents:"none", zIndex:2 }}/>
+        {/* Fade top */}
+        <div style={{ position:"absolute", top:0, left:0, right:0, height:ITEM_H,
+          background:"linear-gradient(to bottom, rgba(0,0,0,0.65), transparent)",
+          pointerEvents:"none", zIndex:3 }}/>
+        {/* Fade bottom */}
+        <div style={{ position:"absolute", bottom:0, left:0, right:0, height:ITEM_H,
+          background:"linear-gradient(to top, rgba(0,0,0,0.65), transparent)",
+          pointerEvents:"none", zIndex:3 }}/>
+        {/* Drum strip */}
+        <div ref={drumRef} style={{ position:"absolute", left:0, right:0, top:ITEM_H, willChange:"transform" }}>
+          {Array.from({ length: count }, (_, i) => {
+            const v = min + i;
+            const dist = Math.abs(v - value);
+            return (
+              <div key={v} style={{ height:ITEM_H, display:"flex", alignItems:"center", justifyContent:"center",
+                fontFamily:"'Bebas Neue',sans-serif", fontSize:38, color:"#fff", letterSpacing:1,
+                opacity: dist === 0 ? 1 : dist === 1 ? 0.45 : 0.15,
+                transform: `scale(${dist === 0 ? 1 : dist === 1 ? 0.84 : 0.7})`,
+                transition:"opacity 0.12s, transform 0.12s" }}>
+                {pad(v)}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <div style={{ fontSize:10, color:"rgba(255,255,255,0.4)", fontFamily:"'Space Mono',monospace", letterSpacing:2 }}>{label}</div>
+    </div>
+  );
+}
+function Sep() {
+  return <div style={{ fontSize:36, fontFamily:"'Bebas Neue',sans-serif", color:"rgba(255,255,255,0.3)", alignSelf:"flex-start", marginTop:12 }}>:</div>;
+}
+function ProgressRing({ progress, color, size=220 }) {
+  const r = (size-16)/2, circ = 2*Math.PI*r, dash = circ * Math.min(1, Math.max(0, progress));
+  return (
+    <svg width={size} height={size} style={{ position:"absolute", top:0, left:0, transform:"rotate(-90deg)" }}>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth={8}/>
+      <circle cx={size/2} cy={size/2} r={r} fill="none" stroke={color} strokeWidth={8}
+        strokeDasharray={`${dash} ${circ}`} strokeLinecap="round"
+        style={{ transition:"stroke-dasharray 0.3s ease, stroke 0.3s ease", filter:`drop-shadow(0 0 8px ${color})` }}/>
+    </svg>
+  );
+}
+
+function AMRAPConfig({ config, setConfig }) {
+  return (
+    <div>
+      <div style={{ color:"rgba(255,255,255,0.5)", fontSize:11, fontFamily:"'Space Mono',monospace", letterSpacing:2, marginBottom:16, textAlign:"center" }}>WORKOUT DURATION</div>
+      <div style={{ display:"flex", alignItems:"flex-start", gap:8, justifyContent:"center" }}>
+        <NumberPicker label="MIN" value={config.minutes||0} onChange={v=>setConfig(c=>({...c,minutes:v}))} max={99}/>
+        <Sep/><NumberPicker label="SEC" value={config.seconds||0} onChange={v=>setConfig(c=>({...c,seconds:v}))} max={59}/>
+      </div>
+    </div>
+  );
+}
+function ForTimeConfig({ config, setConfig }) {
+  return (
+    <div>
+      <div style={{ color:"rgba(255,255,255,0.5)", fontSize:11, fontFamily:"'Space Mono',monospace", letterSpacing:2, marginBottom:16, textAlign:"center" }}>TIME CAP (OPTIONAL)</div>
+      <div style={{ display:"flex", alignItems:"flex-start", gap:8, justifyContent:"center" }}>
+        <NumberPicker label="MIN" value={config.minutes||0} onChange={v=>setConfig(c=>({...c,minutes:v}))} max={99}/>
+        <Sep/><NumberPicker label="SEC" value={config.seconds||0} onChange={v=>setConfig(c=>({...c,seconds:v}))} max={59}/>
+      </div>
+      <div style={{ color:"rgba(255,255,255,0.3)", fontSize:10, fontFamily:"'Space Mono',monospace", textAlign:"center", marginTop:12 }}>SET TO 00:00 FOR NO CAP</div>
+    </div>
+  );
+}
+function EMOMConfig({ config, setConfig }) {
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:24 }}>
+      <div>
+        <div style={{ color:"rgba(255,255,255,0.5)", fontSize:11, fontFamily:"'Space Mono',monospace", letterSpacing:2, marginBottom:16, textAlign:"center" }}>NUMBER OF ROUNDS</div>
+        <div style={{ display:"flex", justifyContent:"center" }}>
+          <NumberPicker label="ROUNDS" value={config.rounds||10} onChange={v=>setConfig(c=>({...c,rounds:v}))} min={1} max={60}/>
+        </div>
+      </div>
+      <div>
+        <div style={{ color:"rgba(255,255,255,0.5)", fontSize:11, fontFamily:"'Space Mono',monospace", letterSpacing:2, marginBottom:16, textAlign:"center" }}>INTERVAL DURATION</div>
+        <div style={{ display:"flex", alignItems:"flex-start", gap:8, justifyContent:"center" }}>
+          <NumberPicker label="MIN" value={config.minutes||1} onChange={v=>setConfig(c=>({...c,minutes:v}))} max={10}/>
+          <Sep/><NumberPicker label="SEC" value={config.seconds||0} onChange={v=>setConfig(c=>({...c,seconds:v}))} max={59}/>
+        </div>
+      </div>
+    </div>
+  );
+}
+function TabataConfig({ config, setConfig }) {
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:24 }}>
+      <div style={{ display:"flex", gap:24, justifyContent:"center" }}>
+        <div>
+          <div style={{ color:"rgba(255,255,255,0.5)", fontSize:11, fontFamily:"'Space Mono',monospace", letterSpacing:2, marginBottom:16, textAlign:"center" }}>WORK (SEC)</div>
+          <NumberPicker label="SEC" value={config.workSeconds||20} onChange={v=>setConfig(c=>({...c,workSeconds:v}))} min={5} max={59}/>
+        </div>
+        <div>
+          <div style={{ color:"rgba(255,255,255,0.5)", fontSize:11, fontFamily:"'Space Mono',monospace", letterSpacing:2, marginBottom:16, textAlign:"center" }}>REST (SEC)</div>
+          <NumberPicker label="SEC" value={config.restSeconds||10} onChange={v=>setConfig(c=>({...c,restSeconds:v}))} min={5} max={59}/>
+        </div>
+      </div>
+      <div>
+        <div style={{ color:"rgba(255,255,255,0.5)", fontSize:11, fontFamily:"'Space Mono',monospace", letterSpacing:2, marginBottom:16, textAlign:"center" }}>ROUNDS</div>
+        <div style={{ display:"flex", justifyContent:"center" }}>
+          <NumberPicker label="ROUNDS" value={config.rounds||8} onChange={v=>setConfig(c=>({...c,rounds:v}))} min={1} max={20}/>
+        </div>
+      </div>
+    </div>
+  );
+}
+function CustomConfig({ config, setConfig }) {
+  const [showPicker, setShowPicker] = useState(false);
+  const intervals = config.intervals || [{label:"WORK",seconds:40,color:"#0A84FF"},{label:"REST",seconds:20,color:"#30D158"}];
+  const update = (i,f,v) => setConfig(c=>({...c,intervals:intervals.map((iv,idx)=>idx===i?{...iv,[f]:v}:iv)}));
+  const addType = (type) => {
+    const isWork = type === "WORK";
+    setConfig(c=>({...c,intervals:[...intervals,{label:type,seconds:isWork?40:20,color:isWork?"#0A84FF":"#30D158"}]}));
+    setShowPicker(false);
+  };
+  const remove = (i) => setConfig(c=>({...c,intervals:intervals.filter((_,idx)=>idx!==i)}));
+  return (
+    <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <div style={{ color:"rgba(255,255,255,0.5)", fontSize:11, fontFamily:"'Space Mono',monospace", letterSpacing:2 }}>INTERVALS</div>
+        <div style={{ position:"relative" }}>
+          <button onClick={() => setShowPicker(p=>!p)}
+            style={{ background:"rgba(191,90,242,0.2)", border:"1px solid rgba(191,90,242,0.4)", color:"#BF5AF2", borderRadius:8, padding:"4px 12px", fontSize:11, fontFamily:"'Space Mono',monospace", cursor:"pointer" }}>
+            + ADD
+          </button>
+          {showPicker && (
+            <div style={{ position:"absolute", right:0, top:"calc(100% + 6px)", background:"#1a1a2e", border:"1px solid rgba(255,255,255,0.12)", borderRadius:12, overflow:"hidden", zIndex:20, minWidth:120, boxShadow:"0 8px 24px rgba(0,0,0,0.5)" }}>
+              <button onClick={() => addType("WORK")}
+                style={{ width:"100%", padding:"10px 16px", background:"transparent", border:"none", borderBottom:"1px solid rgba(255,255,255,0.08)", color:"#0A84FF", fontFamily:"'Space Mono',monospace", fontSize:11, letterSpacing:2, cursor:"pointer", textAlign:"left", display:"flex", alignItems:"center", gap:8 }}>
+                <div style={{ width:8, height:8, borderRadius:"50%", background:"#0A84FF", flexShrink:0 }}/> WORK
+              </button>
+              <button onClick={() => addType("REST")}
+                style={{ width:"100%", padding:"10px 16px", background:"transparent", border:"none", color:"#30D158", fontFamily:"'Space Mono',monospace", fontSize:11, letterSpacing:2, cursor:"pointer", textAlign:"left", display:"flex", alignItems:"center", gap:8 }}>
+                <div style={{ width:8, height:8, borderRadius:"50%", background:"#30D158", flexShrink:0 }}/> REST
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+      {intervals.map((iv,i)=>(
+        <div key={i} style={{ display:"flex", alignItems:"center", gap:10, background:"rgba(255,255,255,0.05)", borderRadius:12, padding:"10px 12px" }}>
+          <div style={{ width:8, height:8, borderRadius:"50%", background:iv.color, flexShrink:0 }}/>
+          <input value={iv.label} onChange={e=>update(i,"label",e.target.value.toUpperCase())} style={{ background:"transparent", border:"none", color:"#fff", fontSize:13, fontFamily:"'Space Mono',monospace", width:70, outline:"none" }}/>
+          <div style={{ display:"flex", alignItems:"center", gap:6, marginLeft:"auto" }}>
+            <button onClick={()=>update(i,"seconds",Math.max(5,iv.seconds-5))} style={{ background:"rgba(255,255,255,0.1)", border:"none", color:"#fff", borderRadius:6, width:24, height:24, cursor:"pointer", fontSize:14, display:"flex", alignItems:"center", justifyContent:"center" }}>−</button>
+            <div style={{ color:"#fff", fontFamily:"'Bebas Neue',sans-serif", fontSize:20, minWidth:42, textAlign:"center" }}>{pad(Math.floor(iv.seconds/60))}:{pad(iv.seconds%60)}</div>
+            <button onClick={()=>update(i,"seconds",Math.min(600,iv.seconds+5))} style={{ background:"rgba(255,255,255,0.1)", border:"none", color:"#fff", borderRadius:6, width:24, height:24, cursor:"pointer", fontSize:14, display:"flex", alignItems:"center", justifyContent:"center" }}>+</button>
+          </div>
+          {intervals.length>1 && <button onClick={()=>remove(i)} style={{ background:"transparent", border:"none", color:"rgba(255,255,255,0.3)", cursor:"pointer", fontSize:16, padding:"0 2px" }}>×</button>}
+        </div>
+      ))}
+      <div style={{ display:"flex", alignItems:"center", gap:10, background:"rgba(255,255,255,0.05)", borderRadius:12, padding:"10px 16px" }}>
+        <div style={{ color:"rgba(255,255,255,0.5)", fontSize:11, fontFamily:"'Space Mono',monospace", letterSpacing:2 }}>ROUNDS</div>
+        <div style={{ display:"flex", alignItems:"center", gap:10, marginLeft:"auto" }}>
+          <button onClick={()=>setConfig(c=>({...c,rounds:Math.max(1,(c.rounds||3)-1)}))} style={{ background:"rgba(255,255,255,0.1)", border:"none", color:"#fff", borderRadius:6, width:28, height:28, cursor:"pointer", fontSize:16 }}>−</button>
+          <div style={{ color:"#fff", fontFamily:"'Bebas Neue',sans-serif", fontSize:26, minWidth:36, textAlign:"center" }}>{config.rounds||3}</div>
+          <button onClick={()=>setConfig(c=>({...c,rounds:Math.min(20,(c.rounds||3)+1)}))} style={{ background:"rgba(255,255,255,0.1)", border:"none", color:"#fff", borderRadius:6, width:28, height:28, cursor:"pointer", fontSize:16 }}>+</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CrossFitTimer() {
+  const [activeMode, setActiveMode] = useState("AMRAP");
+  const [screen, setScreen] = useState("home");
+  const [config, setConfig] = useState({});
+  const [countdown, setCountdown] = useState(15);
+  const [timerState, setTimerState] = useState(null);
+  const [announcement, setAnnouncement] = useState("");
+  const intervalRef = useRef(null);
+  const countdownRef = useRef(null);
+  const announcementRef = useRef(null);
+  const halfwayFiredRef = useRef({});
+  const { beep, speak } = useAudio();
+
+  const colors = MODE_COLORS[activeMode];
+
+  useEffect(() => {
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = "https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Space+Mono:wght@400;700&display=swap";
+    document.head.appendChild(link);
+  }, []);
+
+  const showAnnouncement = useCallback((text, duration=1800) => {
+    setAnnouncement(text);
+    clearTimeout(announcementRef.current);
+    announcementRef.current = setTimeout(() => setAnnouncement(""), duration);
+  }, []);
+
+  const buildInitialState = useCallback(() => {
+    if (activeMode === "AMRAP") {
+      const total = (config.minutes||0)*60 + (config.seconds||0);
+      return { mode:"AMRAP", elapsed:0, total:total||600, running:false, phase:"AMRAP" };
+    }
+    if (activeMode === "FOR TIME") {
+      const cap = (config.minutes||0)*60 + (config.seconds||0);
+      return { mode:"FOR TIME", elapsed:0, total:cap||null, running:false, phase:"FOR TIME" };
+    }
+    if (activeMode === "EMOM") {
+      const interval = (config.minutes||1)*60 + (config.seconds||0);
+      const rounds = config.rounds||10;
+      return { mode:"EMOM", elapsed:0, total:interval*rounds, intervalLen:interval, running:false, phase:"WORK", currentRound:1, totalRounds:rounds };
+    }
+    if (activeMode === "TABATA") {
+      const work=config.workSeconds||20, rest=config.restSeconds||10, rounds=config.rounds||8;
+      return { mode:"TABATA", elapsed:0, workLen:work, restLen:rest, running:false, phase:"WORK", currentRound:1, totalRounds:rounds, phaseElapsed:0 };
+    }
+    if (activeMode === "CUSTOM") {
+      const intervals = config.intervals || [{label:"WORK",seconds:40},{label:"REST",seconds:20}];
+      const rounds = config.rounds||3;
+      return { mode:"CUSTOM", elapsed:0, intervals, running:false, phase:intervals[0].label, currentInterval:0, currentRound:1, totalRounds:rounds, phaseElapsed:0 };
+    }
+  }, [activeMode, config]);
+
+  // ── Countdown ─────────────────────────────────────────────
+  useEffect(() => {
+    if (screen !== "countdown") return;
+    setCountdown(15);
+    halfwayFiredRef.current = {};
+    let cur = 15;
+    countdownRef.current = setInterval(() => {
+      cur -= 1;
+      setCountdown(cur);
+      if (cur <= 3 && cur > 0) {
+        beep(cur===1?1047:cur===2?880:740, 0.18, 0.5);
+        speak(String(cur));
+      }
+      if (cur <= 0) {
+        clearInterval(countdownRef.current);
+        beep(1046, 0.35, 0.6);
+        speak("Go");
+        const state = buildInitialState();
+        setTimerState({ ...state, running:true });
+        setScreen("running");
+      }
+    }, 1000);
+    return () => clearInterval(countdownRef.current);
+  }, [screen]); // eslint-disable-line
+
+  // ── Phase cue helper ───────────────────────────────────────
+  // phaseKey should be unique per phase instance to track halfway
+  const checkPhaseCues = useCallback((phaseElapsed, phaseLen, phaseKey) => {
+    const remaining = phaseLen - phaseElapsed;
+    // 3-2-1 countdown beeps
+    if (remaining === 3) { beep(740, 0.15, 0.4); speak("3"); }
+    if (remaining === 2) { beep(880, 0.15, 0.4); speak("2"); }
+    if (remaining === 1) { beep(1047, 0.15, 0.4); speak("1"); }
+    // Halfway voice — only once per phase
+    if (phaseLen >= 10) {
+      const halfway = Math.floor(phaseLen / 2);
+      if (phaseElapsed === halfway && !halfwayFiredRef.current[phaseKey]) {
+        halfwayFiredRef.current[phaseKey] = true;
+        speak("Halfway there");
+        showAnnouncement("HALFWAY 💪");
+      }
+    }
+  }, [beep, speak, showAnnouncement]);
+
+  // ── Main tick ──────────────────────────────────────────────
+  const tick = useCallback(() => {
+    setTimerState(prev => {
+      if (!prev || !prev.running) return prev;
+      const next = { ...prev, elapsed: prev.elapsed + 1 };
+
+      if (next.mode === "AMRAP") {
+        const remaining = next.total - next.elapsed;
+        checkPhaseCues(next.elapsed, next.total, "amrap");
+        if (remaining <= 0) { beep(440,0.5); speak("Time's up"); return { ...next, running:false, done:true }; }
+        return next;
+      }
+
+      if (next.mode === "FOR TIME") {
+        if (next.total) {
+          const remaining = next.total - next.elapsed;
+          checkPhaseCues(next.elapsed, next.total, "fortime");
+          if (remaining <= 0) { beep(440,0.5); speak("Time cap"); return { ...next, running:false, done:true, capped:true }; }
+        }
+        return next;
+      }
+
+      if (next.mode === "EMOM") {
+        const inInterval = next.elapsed % next.intervalLen;
+        next.currentRound = Math.floor(next.elapsed / next.intervalLen) + 1;
+        const phaseKey = `emom-r${next.currentRound}`;
+        checkPhaseCues(inInterval, next.intervalLen, phaseKey);
+        if (inInterval === 0 && next.elapsed > 0) {
+          beep(880,0.12); speak(`Round ${next.currentRound}`); showAnnouncement(`ROUND ${next.currentRound}`);
+        }
+        if (next.elapsed >= next.total) { beep(440,0.5); speak("Done"); return { ...next, running:false, done:true }; }
+        return next;
+      }
+
+      if (next.mode === "TABATA") {
+        const pe = next.phaseElapsed + 1;
+        const phaseLen = next.phase === "WORK" ? next.workLen : next.restLen;
+        const phaseKey = `tabata-r${next.currentRound}-${next.phase}`;
+        checkPhaseCues(pe, phaseLen, phaseKey);
+        if (pe >= phaseLen) {
+          if (next.phase === "WORK") {
+            if (next.currentRound >= next.totalRounds) { beep(440,0.5); speak("Done"); return { ...next, running:false, done:true }; }
+            beep(660,0.12); speak("Rest"); showAnnouncement("REST");
+            return { ...next, phase:"REST", phaseElapsed:0 };
+          } else {
+            const nr = next.currentRound + 1;
+            beep(880,0.12); speak(`Round ${nr}`); showAnnouncement(`ROUND ${nr}`);
+            return { ...next, phase:"WORK", phaseElapsed:0, currentRound:nr };
+          }
+        }
+        return { ...next, phaseElapsed:pe };
+      }
+
+      if (next.mode === "CUSTOM") {
+        const pe = next.phaseElapsed + 1;
+        const curIv = next.intervals[next.currentInterval];
+        const phaseKey = `custom-r${next.currentRound}-i${next.currentInterval}`;
+        checkPhaseCues(pe, curIv.seconds, phaseKey);
+        if (pe >= curIv.seconds) {
+          const nIdx = next.currentInterval + 1;
+          if (nIdx >= next.intervals.length) {
+            if (next.currentRound >= next.totalRounds) { beep(440,0.5); speak("Done"); return { ...next, running:false, done:true }; }
+            const nr = next.currentRound + 1;
+            beep(880,0.12); speak(`Round ${nr}`); showAnnouncement(`ROUND ${nr}`);
+            return { ...next, currentInterval:0, phase:next.intervals[0].label, phaseElapsed:0, currentRound:nr };
+          }
+          const nextLabel = next.intervals[nIdx].label;
+          beep(660,0.12); speak(nextLabel); showAnnouncement(nextLabel);
+          return { ...next, currentInterval:nIdx, phase:nextLabel, phaseElapsed:0 };
+        }
+        return { ...next, phaseElapsed:pe };
+      }
+
+      return next;
+    });
+  }, [checkPhaseCues, beep, speak, showAnnouncement]);
+
+  useEffect(() => {
+    if (timerState?.running) { intervalRef.current = setInterval(tick, 1000); }
+    else { clearInterval(intervalRef.current); }
+    return () => clearInterval(intervalRef.current);
+  }, [timerState?.running, tick]);
+
+  const togglePause = () => setTimerState(p => p ? { ...p, running:!p.running } : p);
+  const resetTimer = () => { clearInterval(intervalRef.current); setTimerState(null); setScreen("config"); };
+  const finishForTime = () => { beep(880,0.3); setTimerState(p => ({ ...p, running:false, done:true, finalTime:p.elapsed })); };
+
+  const getDisplay = () => {
+    if (!timerState) return {};
+    const t = timerState;
+    if (t.mode === "AMRAP") {
+      const rem = Math.max(0, t.total - t.elapsed);
+      return { mainTime:formatTime(rem), progress:t.elapsed/t.total, label:"AMRAP", sub:"MAX EFFORT" };
+    }
+    if (t.mode === "FOR TIME") {
+      return { mainTime:formatTime(t.elapsed), progress:t.total?t.elapsed/t.total:0, label:"FOR TIME", sub:t.total?`CAP: ${formatTime(Math.max(0,t.total-t.elapsed))}`:"NO CAP" };
+    }
+    if (t.mode === "EMOM") {
+      const inInterval = t.elapsed % t.intervalLen;
+      return { mainTime:formatTime(Math.max(0,t.intervalLen-inInterval)), progress:inInterval/t.intervalLen, label:`ROUND ${t.currentRound}/${t.totalRounds}`, sub:"EMOM" };
+    }
+    if (t.mode === "TABATA") {
+      const phaseLen = t.phase==="WORK"?t.workLen:t.restLen;
+      return { mainTime:formatTime(Math.max(0,phaseLen-t.phaseElapsed)), progress:t.phaseElapsed/phaseLen, label:t.phase, sub:`ROUND ${t.currentRound}/${t.totalRounds}`, isRest:t.phase==="REST" };
+    }
+    if (t.mode === "CUSTOM") {
+      const curIv = t.intervals[t.currentInterval];
+      return { mainTime:formatTime(Math.max(0,curIv.seconds-t.phaseElapsed)), progress:t.phaseElapsed/curIv.seconds, label:t.phase, sub:`ROUND ${t.currentRound}/${t.totalRounds} · ${t.currentInterval+1}/${t.intervals.length}` };
+    }
+    return {};
+  };
+  const display = getDisplay();
+  const ringColor = display.isRest ? "#30D158" : colors.primary;
+
+  const phoneStyle = {
+    width:"min(390px, 100vw)", height:"100dvh", background:colors.bg, borderRadius:48, overflow:"hidden",
+    position:"relative", fontFamily:"'Space Mono',monospace",
+    border:"1px solid rgba(255,255,255,0.08)",
+    boxShadow:`0 40px 120px rgba(0,0,0,0.8), inset 0 0 80px rgba(${hexToRgb(colors.primary)},0.03)`,
+    transition:"background 0.5s ease", display:"flex", flexDirection:"column",
+  };
+  const GlowBlob = () => (
+    <div style={{ position:"absolute", top:-100, left:"50%", transform:"translateX(-50%)", width:400, height:400, borderRadius:"50%",
+      background:`radial-gradient(circle, rgba(${hexToRgb(colors.primary)},0.12) 0%, transparent 70%)`,
+      pointerEvents:"none", zIndex:0, transition:"background 0.5s" }}/>
+  );
+  const StatusBar = () => (
+    <div style={{ padding:"max(env(safe-area-inset-top,12px),12px) 24px 0", display:"flex", justifyContent:"space-between", color:"rgba(255,255,255,0.4)", fontSize:11, position:"relative", zIndex:1, flexShrink:0 }}>
+      <span>9:41</span><span>●●●●● WiFi 🔋</span>
+    </div>
+  );
+
+  // ══ HOME ══════════════════════════════════════════════════
+  if (screen === "home") return (
+    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", background:"#080808" }}>
+      <div style={phoneStyle}>
+        <GlowBlob/><StatusBar/>
+        <div style={{ padding:"28px 28px 0", position:"relative", zIndex:1 }}>
+          <div style={{ fontSize:11, letterSpacing:4, color:colors.accent, marginBottom:4 }}>WOD</div>
+          <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:48, color:"#fff", lineHeight:1, letterSpacing:2 }}>TIMER</div>
+        </div>
+        <div style={{ padding:"32px 24px", flex:1, position:"relative", zIndex:1 }}>
+          <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
+            {MODES.map(mode => {
+              const mc = MODE_COLORS[mode], isActive = mode === activeMode;
+              return (
+                <button key={mode} onClick={() => { setActiveMode(mode); setConfig({}); }}
+                  style={{ background:isActive?`rgba(${hexToRgb(mc.primary)},0.15)`:"rgba(255,255,255,0.03)",
+                    border:isActive?`1px solid rgba(${hexToRgb(mc.primary)},0.5)`:"1px solid rgba(255,255,255,0.07)",
+                    borderRadius:20, padding:"18px 22px", display:"flex", alignItems:"center", justifyContent:"space-between",
+                    cursor:"pointer", transition:"all 0.25s ease", transform:isActive?"scale(1.02)":"scale(1)" }}>
+                  <div>
+                    <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:26, color:isActive?mc.primary:"rgba(255,255,255,0.5)", letterSpacing:2, lineHeight:1 }}>{mode}</div>
+                    <div style={{ fontSize:10, color:isActive?"rgba(255,255,255,0.5)":"rgba(255,255,255,0.2)", marginTop:3, letterSpacing:1 }}>{MODE_DESCRIPTIONS[mode]}</div>
+                  </div>
+                  {isActive && <div style={{ width:8, height:8, borderRadius:"50%", background:mc.primary, boxShadow:`0 0 10px ${mc.primary}` }}/>}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+        <div style={{ padding:"0 20px max(env(safe-area-inset-bottom,20px),20px)", position:"relative", zIndex:1, flexShrink:0 }}>
+          <button onClick={() => setScreen("config")}
+            style={{ width:"100%", padding:"20px 0", background:`linear-gradient(135deg, ${colors.primary}, ${colors.accent})`,
+              border:"none", borderRadius:20, fontFamily:"'Bebas Neue',sans-serif", fontSize:24, letterSpacing:3,
+              color:"#000", cursor:"pointer", boxShadow:`0 8px 32px rgba(${hexToRgb(colors.primary)},0.4)` }}>
+            SET UP {activeMode} →
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ══ CONFIG ════════════════════════════════════════════════
+  if (screen === "config") return (
+    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", background:"#080808" }}>
+      <div style={phoneStyle}>
+        <GlowBlob/><StatusBar/>
+        <div style={{ padding:"12px 20px 8px", display:"flex", alignItems:"center", gap:14, position:"relative", zIndex:1, flexShrink:0 }}>
+          <button onClick={() => setScreen("home")} style={{ background:"rgba(255,255,255,0.08)", border:"none", color:"#fff", borderRadius:12, width:36, height:36, cursor:"pointer", fontSize:16, display:"flex", alignItems:"center", justifyContent:"center" }}>←</button>
+          <div>
+            <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:32, color:colors.primary, letterSpacing:2, lineHeight:1 }}>{activeMode}</div>
+            <div style={{ fontSize:10, color:"rgba(255,255,255,0.4)", letterSpacing:1 }}>CONFIGURE</div>
+          </div>
+        </div>
+        <div style={{ padding:"8px 20px 0", flex:1, position:"relative", zIndex:1, overflow:"auto", display:"flex", flexDirection:"column", gap:10 }}>
+          <div style={{ background:"rgba(255,255,255,0.04)", borderRadius:20, padding:"20px 16px", border:"1px solid rgba(255,255,255,0.06)" }}>
+            {activeMode === "AMRAP"    && <AMRAPConfig    config={config} setConfig={setConfig}/>}
+            {activeMode === "FOR TIME" && <ForTimeConfig  config={config} setConfig={setConfig}/>}
+            {activeMode === "EMOM"     && <EMOMConfig     config={config} setConfig={setConfig}/>}
+            {activeMode === "TABATA"   && <TabataConfig   config={config} setConfig={setConfig}/>}
+            {activeMode === "CUSTOM"   && <CustomConfig   config={config} setConfig={setConfig}/>}
+          </div>
+          <div style={{ background:`rgba(${hexToRgb(colors.primary)},0.08)`, borderRadius:14, padding:"10px 14px", border:`1px solid rgba(${hexToRgb(colors.primary)},0.2)` }}>
+            <div style={{ color:colors.accent, fontSize:9, letterSpacing:2, marginBottom:4 }}>WORKOUT SUMMARY</div>
+            {activeMode === "AMRAP"    && <div style={{ color:"rgba(255,255,255,0.6)", fontSize:10 }}>{config.minutes||0}m {config.seconds||0}s of max effort</div>}
+            {activeMode === "FOR TIME" && <div style={{ color:"rgba(255,255,255,0.6)", fontSize:10 }}>{(config.minutes||0)===0&&(config.seconds||0)===0?"No cap — finish at your pace":`${config.minutes||0}m ${config.seconds||0}s time cap`}</div>}
+            {activeMode === "EMOM"     && <div style={{ color:"rgba(255,255,255,0.6)", fontSize:10 }}>{config.rounds||10} rounds × {config.minutes||1}m {config.seconds||0}s</div>}
+            {activeMode === "TABATA"   && <div style={{ color:"rgba(255,255,255,0.6)", fontSize:10 }}>{config.rounds||8} rounds · {config.workSeconds||20}s work / {config.restSeconds||10}s rest</div>}
+            {activeMode === "CUSTOM"   && <div style={{ color:"rgba(255,255,255,0.6)", fontSize:10 }}>{(config.intervals||[]).length||2} intervals × {config.rounds||3} rounds</div>}
+          </div>
+          <div style={{ textAlign:"center", color:"rgba(255,255,255,0.18)", fontSize:9, letterSpacing:2 }}>⏱ 15s COUNTDOWN BEFORE START</div>
+        </div>
+        <div style={{ padding:"10px 20px 16px", flexShrink:0, position:"relative", zIndex:1 }}>
+          <button onClick={() => setScreen("countdown")}
+            style={{ width:"100%", padding:"16px 0", background:`linear-gradient(135deg, ${colors.primary}, ${colors.accent})`,
+              border:"none", borderRadius:18, fontFamily:"'Bebas Neue',sans-serif", fontSize:26, letterSpacing:4,
+              color:"#000", cursor:"pointer", boxShadow:`0 8px 32px rgba(${hexToRgb(colors.primary)},0.4)` }}>
+            START ▶
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ══ COUNTDOWN ════════════════════════════════════════════
+  if (screen === "countdown") return (
+    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", background:"#080808" }}>
+      <style>{`
+        @keyframes pulse { from { transform:scale(1); } to { transform:scale(1.1); } }
+        @keyframes shake { 0%,100%{transform:translateX(0)} 25%{transform:translateX(-6px)} 75%{transform:translateX(6px)} }
+      `}</style>
+      <div style={phoneStyle}>
+        <GlowBlob/><StatusBar/>
+        <div style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", position:"relative", zIndex:1, gap:20 }}>
+          <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:13, letterSpacing:7, color:"rgba(255,255,255,0.35)" }}>GET READY</div>
+          
+          {/* Giant number */}
+          <div style={{
+            fontFamily:"'Bebas Neue',sans-serif",
+            fontSize: countdown <= 3 ? 160 : 120,
+            color: countdown <= 3 ? colors.primary : "#ffffff",
+            lineHeight:1, letterSpacing:2,
+            transition:"font-size 0.15s ease, color 0.2s ease",
+            textShadow: countdown <= 3 ? `0 0 60px ${colors.primary}, 0 0 120px rgba(${hexToRgb(colors.primary)},0.5)` : `0 0 20px rgba(255,255,255,0.1)`,
+            animation: countdown <= 3 ? "pulse 0.4s ease-in-out infinite alternate" : countdown === 0 ? "shake 0.3s ease" : "none",
+          }}>{countdown > 0 ? countdown : "GO!"}</div>
+
+          <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:18, letterSpacing:5, color:colors.accent }}>{activeMode}</div>
+
+          {/* Progress track */}
+          <div style={{ width:220, height:5, background:"rgba(255,255,255,0.08)", borderRadius:4, overflow:"hidden", marginTop:4 }}>
+            <div style={{ height:"100%", background:`linear-gradient(90deg, ${colors.primary}, ${colors.accent})`,
+              width:`${((15-countdown)/15)*100}%`, transition:"width 0.95s linear",
+              boxShadow:`0 0 10px ${colors.primary}` }}/>
+          </div>
+          <div style={{ fontSize:10, color:"rgba(255,255,255,0.2)", letterSpacing:2, fontFamily:"'Space Mono',monospace" }}>STARTING IN {countdown}s</div>
+
+          <button onClick={() => { clearInterval(countdownRef.current); setScreen("config"); }}
+            style={{ marginTop:16, background:"rgba(255,255,255,0.05)", border:"1px solid rgba(255,255,255,0.1)", color:"rgba(255,255,255,0.35)", borderRadius:14, padding:"10px 28px", fontFamily:"'Space Mono',monospace", fontSize:10, letterSpacing:2, cursor:"pointer" }}>
+            CANCEL
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ══ RUNNING ══════════════════════════════════════════════
+  if (screen === "running" && timerState) {
+    const isDone = timerState.done;
+    return (
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", background:"#080808" }}>
+        <style>{`
+          @keyframes fadeInUp { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }
+          @keyframes fadeOut  { from{opacity:1} to{opacity:0} }
+        `}</style>
+        <div style={phoneStyle}>
+          <GlowBlob/><StatusBar/>
+          <div style={{ textAlign:"center", padding:"16px 0 0", position:"relative", zIndex:1 }}>
+            <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:18, letterSpacing:5, color:colors.primary }}>{activeMode}</div>
+          </div>
+
+          {/* Announcement flash */}
+          {announcement && (
+            <div style={{ position:"absolute", top:"28%", left:0, right:0, zIndex:10, display:"flex", justifyContent:"center", pointerEvents:"none" }}>
+              <div style={{ background:`rgba(${hexToRgb(colors.primary)},0.92)`, borderRadius:18, padding:"14px 32px",
+                fontFamily:"'Bebas Neue',sans-serif", fontSize:34, letterSpacing:4, color:"#000",
+                boxShadow:`0 0 50px rgba(${hexToRgb(colors.primary)},0.7)`,
+                animation:"fadeInUp 0.2s ease" }}>
+                {announcement}
+              </div>
+            </div>
+          )}
+
+          <div style={{ display:"flex", flex:1, flexDirection:"column", alignItems:"center", justifyContent:"center", position:"relative", zIndex:1, gap:8 }}>
+            <div style={{ position:"relative", width:220, height:220, display:"flex", alignItems:"center", justifyContent:"center" }}>
+              <ProgressRing progress={isDone?1:(display.progress||0)} color={isDone?"#30D158":ringColor} size={220}/>
+              <div style={{ textAlign:"center" }}>
+                {isDone ? (
+                  <>
+                    <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:42, color:"#30D158", letterSpacing:2, lineHeight:1 }}>DONE!</div>
+                    {timerState.mode==="FOR TIME" && timerState.finalTime && (
+                      <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:32, color:"#fff", letterSpacing:1 }}>{formatTime(timerState.finalTime)}</div>
+                    )}
+                    {timerState.capped && <div style={{ fontSize:10, color:"#FF3B30", letterSpacing:2, marginTop:4 }}>TIME CAP</div>}
+                  </>
+                ) : (
+                  <>
+                    <div style={{ fontFamily:"'Bebas Neue',sans-serif", fontSize:62, color:"#fff", lineHeight:1, letterSpacing:2 }}>{display.mainTime}</div>
+                    <div style={{ fontSize:10, color:"rgba(255,255,255,0.4)", letterSpacing:3, marginTop:4 }}>{display.sub}</div>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {!isDone && (
+              <div style={{ background:`rgba(${hexToRgb(ringColor)},0.15)`, border:`1px solid rgba(${hexToRgb(ringColor)},0.3)`,
+                borderRadius:20, padding:"8px 20px", fontFamily:"'Bebas Neue',sans-serif", fontSize:22, letterSpacing:3, color:ringColor }}>
+                {display.label}
+              </div>
+            )}
+
+            {timerState.mode==="EMOM" && !isDone && (
+              <div style={{ display:"flex", gap:6, marginTop:8, flexWrap:"wrap", justifyContent:"center", maxWidth:260 }}>
+                {Array.from({length:timerState.totalRounds},(_,i)=>(
+                  <div key={i} style={{ width:8, height:8, borderRadius:"50%", background:i<timerState.currentRound?colors.primary:"rgba(255,255,255,0.15)", transition:"background 0.3s", boxShadow:i===timerState.currentRound-1?`0 0 6px ${colors.primary}`:"none" }}/>
+                ))}
+              </div>
+            )}
+            {timerState.mode==="TABATA" && !isDone && (
+              <div style={{ display:"flex", gap:6, marginTop:8 }}>
+                {Array.from({length:timerState.totalRounds},(_,i)=>(
+                  <div key={i} style={{ width:8, height:8, borderRadius:"50%", background:i<timerState.currentRound?"#0A84FF":"rgba(255,255,255,0.15)", transition:"background 0.3s" }}/>
+                ))}
+              </div>
+            )}
+
+            {timerState.mode==="FOR TIME" && !isDone && timerState.running && (
+              <button onClick={finishForTime}
+                style={{ marginTop:8, background:`rgba(${hexToRgb(colors.primary)},0.15)`, border:`1px solid rgba(${hexToRgb(colors.primary)},0.3)`, borderRadius:16, padding:"10px 28px", color:colors.accent, fontFamily:"'Space Mono',monospace", fontSize:11, letterSpacing:2, cursor:"pointer" }}>
+                FINISH ✓
+              </button>
+            )}
+          </div>
+
+          <div style={{ padding:"0 20px max(env(safe-area-inset-bottom,20px),20px)", position:"relative", zIndex:1, display:"flex", gap:12, flexShrink:0 }}>
+            <button onClick={resetTimer}
+              style={{ flex:1, padding:"18px 0", background:"rgba(255,255,255,0.06)", border:"1px solid rgba(255,255,255,0.1)", borderRadius:18, color:"rgba(255,255,255,0.6)", fontFamily:"'Bebas Neue',sans-serif", fontSize:20, letterSpacing:3, cursor:"pointer" }}>
+              RESET
+            </button>
+            {!isDone ? (
+              <button onClick={togglePause}
+                style={{ flex:2, padding:"18px 0", background:`linear-gradient(135deg, ${colors.primary}, ${colors.accent})`, border:"none", borderRadius:18, color:"#000", fontFamily:"'Bebas Neue',sans-serif", fontSize:24, letterSpacing:3, cursor:"pointer", boxShadow:`0 8px 24px rgba(${hexToRgb(colors.primary)},0.35)` }}>
+                {timerState.running?"⏸ PAUSE":"▶ RESUME"}
+              </button>
+            ) : (
+              <button onClick={() => { setTimerState(null); setScreen("home"); }}
+                style={{ flex:2, padding:"18px 0", background:"linear-gradient(135deg, #30D158, #66E68A)", border:"none", borderRadius:18, color:"#000", fontFamily:"'Bebas Neue',sans-serif", fontSize:24, letterSpacing:3, cursor:"pointer" }}>
+                HOME ←
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
+}
+
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<CrossFitTimer />);
+  </script>
+</body>
+</html>
